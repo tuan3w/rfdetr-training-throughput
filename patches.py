@@ -288,6 +288,315 @@ def _apply_triton_msda() -> str:
     return "triton_msda: fused deformable attention (gather+bilinear+weight+sum) with fused backward"
 
 
+def _apply_cuda_lap() -> str:
+    """Solve the assignment on the device instead of shipping the costs to the host.
+
+    RF-DETR reaches ``torch_linear_assignment.batch_linear_assignment``, which on
+    this workload lands on the SciPy fallback: it copies every cost matrix to the
+    host (Nsight: 11-13 ms/step of pageable device-to-host traffic) and blocks on
+    a ``cudaStreamSynchronize`` while the CPU solves. NVTX attributes ~72 ms of
+    host time per microbatch to the criterion waiting on that, even with the
+    solve parallelised across 8 threads.
+
+    ``lab/kernels_lap.py`` solves the same problems exactly on the GPU — one CUDA
+    block per problem, Jonker-Volgenant shortest augmenting paths — in 1.5-1.7 ms
+    for the whole step's 520 problems, with nothing leaving the device. Batches
+    outside its envelope (non-CUDA, non-float32, ``tasks > workers``, or more
+    workers than the shared-memory budget allows) fall through to the original
+    implementation, so behaviour is unchanged wherever the kernel declines.
+    """
+    from torch_linear_assignment import assignment as assignment_module
+
+    from lab.kernels_lap import batch_lap, supported
+
+    original = assignment_module.batch_linear_assignment
+
+    def batch_linear_assignment(cost: Any) -> Any:
+        if supported(cost):
+            return batch_lap(cost)
+        return original(cost)
+
+    assignment_module.batch_linear_assignment = batch_linear_assignment
+    # rfdetr imports the function into its own module namespace at call time via
+    # `import torch_linear_assignment`, so patching the module attribute is
+    # enough; this line keeps the package-level alias consistent for anything
+    # that imported it earlier.
+    import torch_linear_assignment
+
+    torch_linear_assignment.batch_linear_assignment = batch_linear_assignment
+    return "cuda_lap: exact Jonker-Volgenant assignment solved on the GPU (no cost-matrix host transfer)"
+
+
+def _apply_device_indices() -> str:
+    """Unpack the assignment on the device so the criterion never synchronises.
+
+    ``_assignment._assign_padded`` solves the batch, copies the index pairs to the
+    host (``_solve_to_indices``'s ``.cpu()``) and drops padded columns there. That
+    was the right split when the solve ran on the host, but with ``cuda_lap`` the
+    indices are born on the device, and the copy is what makes the criterion
+    synchronise: every later ``target["boxes"][target_indices]`` and
+    ``outputs["pred_boxes"][idx]`` indexes a CUDA tensor with a CPU index tensor.
+    ``lab/sync_probe.py`` attributes 156 synchronising operations per step, ~130 of
+    them to exactly those uses (``criterion.py:904``, ``:906``, ``:562``, ``:722``,
+    ``:576-580``).
+
+    Two details make the device version sync-free:
+
+    * The padded columns cannot be dropped with a boolean mask, because masked
+      indexing has a data-dependent output size and so synchronises itself.
+      Instead each problem's pairs are sorted by column: padded columns are
+      exactly those at or above the image's target count, so a stable ascending
+      sort puts every real column first, and the real pairs are then read with a
+      selection index that depends only on ``sizes`` (known on the host already).
+    * That selection index is the same for every step with the same target
+      counts, so it is cached rather than rebuilt.
+
+    Sorting by column reorders the pairs within an image instead of leaving them
+    in row order. The pairing is permuted identically on both sides, and every
+    consumer either sums over pairs or scatters into distinct slots, so the loss
+    is unchanged -- ``lab/verify_matcher.py`` checks this on real batches.
+    """
+    import torch
+
+    from rfdetr.models import _assignment
+
+    original = _assignment._assign_padded
+    index_cache: dict[tuple, Any] = {}
+
+    def selection_index(sizes: tuple[int, ...], layers: int, group_detr: int, stride: int, device: Any) -> Any:
+        """Flat positions of the real (non-padded) pairs, per problem."""
+        key = (sizes, layers, group_detr, stride, device)
+        cached = index_cache.get(key)
+        if cached is None:
+            per_problem = [size for _ in range(layers) for size in sizes for _ in range(group_detr)]
+            starts = torch.arange(len(per_problem), dtype=torch.int64) * stride
+            cached = torch.cat(
+                [start + torch.arange(size, dtype=torch.int64) for start, size in zip(starts.tolist(), per_problem)]
+            ).to(device, non_blocking=True)
+            index_cache[key] = cached
+        return cached
+
+    def assign_padded(
+        cost_matrices: list[Any], sizes: list[int], group_width: int, group_detr: int
+    ) -> list[list[tuple[Any, Any]]]:
+        import torch_linear_assignment
+
+        max_size = max(sizes)
+        stacked = _assignment._stack_padded(cost_matrices, sizes, group_width, group_detr, max_size)
+        assignment = torch_linear_assignment.batch_linear_assignment(stacked)
+        if not assignment.is_cuda:
+            return original(cost_matrices, sizes, group_width, group_detr)
+
+        num_matches = min(group_width, max_size)
+        matched = assignment >= 0
+        order = torch.argsort(matched.to(torch.int8), dim=1, descending=True, stable=True)
+        rows = order[:, :num_matches]
+        cols = assignment.gather(1, rows)
+
+        # Real columns first, padded ones last, without a data-dependent mask.
+        by_column = torch.argsort(cols, dim=1, stable=True)
+        group_offset = torch.arange(rows.shape[0], device=rows.device, dtype=rows.dtype) % group_detr * group_width
+        kept_rows = (rows + group_offset.unsqueeze(1)).gather(1, by_column).reshape(-1)
+        kept_cols = cols.gather(1, by_column).reshape(-1)
+
+        flat = selection_index(tuple(sizes), len(cost_matrices), group_detr, num_matches, rows.device)
+        kept_rows = kept_rows.index_select(0, flat)
+        kept_cols = kept_cols.index_select(0, flat)
+
+        per_image = [group_detr * size for _ in cost_matrices for size in sizes]
+        row_chunks = torch.split(kept_rows, per_image)
+        col_chunks = torch.split(kept_cols, per_image)
+        return [
+            [
+                (
+                    row_chunks[layer_index * len(sizes) + image_index],
+                    col_chunks[layer_index * len(sizes) + image_index],
+                )
+                for image_index in range(len(sizes))
+            ]
+            for layer_index in range(len(cost_matrices))
+        ]
+
+    _assignment._assign_padded = assign_padded
+    return "device_indices: assignment unpacked on the GPU (no host round trip in the criterion)"
+
+
+def _apply_compile_backbone() -> str:
+    """Stop one tiny op from forcing the whole DINOv2 backbone into eager mode.
+
+    With ``compile=True`` every graph that reaches the backbone fails to compile:
+
+        BackendCompilerFailed: backend='inductor' raised:
+        RuntimeError: isIntList() INTERNAL ASSERT FAILED ... Expected IntList but
+        got GenericList
+
+    ``tlparse`` puts the blame precisely (7 of the traced compile ids, frames 0-5
+    and 7). The failing node is the positional-embedding resize in
+    ``dinov2_with_windowed_attn.interpolate_pos_encoding``::
+
+        _upsample_bicubic2d_aa_backward(grad, [floordiv, floordiv],
+                                        [1, 384, 36, 36], False)
+
+    ``rfdetr`` compiles with ``dynamic=True`` so that one graph serves all
+    multi-scale resolutions, which makes the resize target the symbolic
+    ``(s97 // 16)``; the antialiased-bicubic *backward* cannot take a symbolic
+    output size, so the whole graph is rejected. ``suppress_errors=True`` then
+    hides it and the backbone -- the dominant compute in the model -- silently
+    runs eager. Upstream knows: ``module_model.py:439`` names this exact
+    subgraph as the reason for keeping ``suppress_errors`` on.
+
+    The fix keeps ``dynamic=True`` and evicts only the offending op: disabling
+    Dynamo for ``interpolate_pos_encoding`` graph-breaks around one bicubic
+    resize of a ``[1, 384, 36, 36]`` tensor and lets inductor compile everything
+    around it. Specialising the resolution instead would compile the resize too,
+    but at the cost of a separate graph per multi-scale size.
+    """
+    import torch
+
+    from rfdetr.models.backbone import dinov2_with_windowed_attn as windowed
+
+    embeddings = windowed.WindowedDinov2WithRegistersEmbeddings
+    embeddings.interpolate_pos_encoding = torch.compiler.disable(  # type: ignore[method-assign]
+        embeddings.interpolate_pos_encoding
+    )
+    return "compile_backbone: pos-embed resize left eager so inductor can compile the backbone"
+
+
+def _apply_static_compile() -> str:
+    """Compile with concrete shapes instead of symbolic ones.
+
+    ``module_model.py:450`` compiles with ``dynamic=True`` so that one graph
+    serves every multi-scale resolution. The cost of that choice is severe:
+    the model's FX graph is ~800 KB of nodes whose shapes are all expressions in
+    one symbol, and inductor's shape reasoning over it is single-threaded sympy
+    work -- a single frame ran for 22 minutes without finishing, with the GPU
+    idle and one core pinned. ``suppress_errors=True`` hides the fallout, so the
+    model forward silently runs eager (``tlparse`` shows compile ids 0-5 and 7,
+    all rooted at ``lwdetr.py:477``, failing with ``BackendCompilerFailed``).
+
+    With ``dynamic=False`` each resolution gets its own graph with concrete
+    shapes, which removes the symbolic reasoning entirely. The multi-scale
+    sampler draws from a fixed, small set of sizes, so the number of graphs is
+    bounded -- the recompile limits are raised to fit them, and inductor's
+    on-disk FX graph cache means a production run pays the compile once.
+
+    ``capture_scalar_outputs`` is turned back off: upstream enables it only
+    because ``dynamic=True`` makes ``.item()`` results backed symbols. Without
+    dynamic they are unbacked, so the safe behaviour is to let those sites graph
+    break instead.
+    """
+    import torch
+
+    original = torch.compile
+
+    def compile_static(model: Any = None, **kwargs: Any) -> Any:
+        kwargs["dynamic"] = False
+        return original(model, **kwargs)
+
+    torch.compile = compile_static  # type: ignore[assignment]
+    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.accumulated_cache_size_limit = 512
+    torch._dynamo.config.capture_scalar_outputs = False
+    return "static_compile: dynamic=False so inductor sees concrete shapes"
+
+
+def _apply_compile_blocks() -> str:
+    """Compile the backbone's transformer blocks individually.
+
+    The model as a whole never compiles: the positional-embedding resize in
+    ``interpolate_pos_encoding`` rejects the graph (see REJECTED in
+    lab/baseline.py), so ``suppress_errors=True`` runs the forward eagerly. Nsight
+    shows what that costs: with the device 85.4% busy, 48% of the remaining idle
+    is 10,612 gaps of 5-50 us -- launch latency from the many small unfused
+    elementwise kernels an eager transformer block emits.
+
+    Compiling the whole graph to fix that was measured and rejected (22 minutes on
+    one frame with ``dynamic=True``, 2-3 min per resolution with ``dynamic=False``
+    across 8 multi-scale sizes). This takes the opposite approach: compile each
+    ``WindowedDinov2WithRegistersLayer`` on its own. The blocks are 16 instances of
+    one small module, and torch 2.14 inlines module parameters as graph inputs, so
+    they share a single compiled graph -- a small graph that compiles quickly,
+    while the embeddings module with the offending resize is never traced at all.
+
+    Left deliberately alone: the patch-embedding and pos-embed path (the thing
+    that cannot compile) and the decoder, so this measures exactly one change.
+    """
+    import torch
+
+    from rfdetr.models.backbone import dinov2_with_windowed_attn as windowed
+
+    layer = windowed.WindowedDinov2WithRegistersLayer
+    if getattr(layer, "_lab_compiled", False):
+        return "compile_blocks: already applied"
+    layer.forward = torch.compile(layer.forward, dynamic=True)  # type: ignore[method-assign]
+    layer._lab_compiled = True  # type: ignore[attr-defined]
+    return "compile_blocks: DINOv2 blocks compiled individually (one shared graph)"
+
+
+def _msda_original() -> Any:
+    """The unpatched deformable-attention core, captured before replacement."""
+    from rfdetr.models.ops.functions import ms_deform_attn_core_pytorch
+
+    return ms_deform_attn_core_pytorch
+
+
+_ORIGINAL_MSDA_CORE = None
+
+
+def _apply_fused_msda() -> str:
+    """Replace the deformable-attention fallback with the real fused CUDA kernel.
+
+    rfdetr 1.10.1 has no compiled deformable-attention extension
+    (``import MultiScaleDeformableAttention`` fails), so it runs
+    ``ms_deform_attn_core_pytorch`` -- a function whose own docstring says "For
+    debug and test only, need to use cuda version instead". It composes one
+    ``F.grid_sample`` per feature level plus a stack, multiply and sum.
+
+    Nsight shows it is the largest non-GEMM cost in the profile: in a 1.4 s
+    steady window ``grid_sampler_2d_backward_kernel<float, int>`` takes 65.5 ms
+    over 30 calls, in fp32 because autocast keeps ``grid_sampler`` off bf16.
+
+    ``lab/kernels_msda_cuda.py`` wraps the Deformable-DETR kernel (fused forward,
+    hand-written backward) fetched prebuilt from the Hugging Face kernels hub for
+    this exact torch/CUDA build. It runs in fp32, matching what autocast already
+    does to this path, so the substitution is numerically equivalent rather than a
+    precision trade: forward matches to 3.2e-06 and gradients to 7.5e-04 against
+    location gradients of scale 5.7e+02. Standalone it is 3.9-5.0x faster on the
+    production shapes, forward and backward together.
+    """
+    from rfdetr.models.ops.modules import ms_deform_attn as module
+
+    from lab.kernels_msda_cuda import deformable_attention, kernel
+
+    global _ORIGINAL_MSDA_CORE
+    if _ORIGINAL_MSDA_CORE is None:
+        _ORIGINAL_MSDA_CORE = _msda_original()
+
+    kernel()  # surface a download or ABI problem here rather than mid-step
+
+    def core(
+        value: Any,
+        value_spatial_shapes: Any,
+        sampling_locations: Any,
+        attention_weights: Any,
+        value_spatial_shapes_hw: Any = None,
+    ) -> Any:
+        # The export path passes rank-5 sampling locations, which the kernel does
+        # not accept; training never takes it, but keep the fallback reachable.
+        if sampling_locations.ndim != 6 or not value.is_cuda:
+            return _ORIGINAL_MSDA_CORE(
+                value,
+                value_spatial_shapes,
+                sampling_locations,
+                attention_weights,
+                value_spatial_shapes_hw=value_spatial_shapes_hw,
+            )
+        return deformable_attention(value, value_spatial_shapes, sampling_locations, attention_weights)
+
+    module.ms_deform_attn_core_pytorch = core
+    return "fused_msda: deformable attention uses the fused CUDA kernel (3.9-5.0x standalone)"
+
+
 PATCHES = {
     "cdist_l1": _apply_cdist_l1,
     "pinned_d2h": _apply_pinned_d2h,
@@ -296,6 +605,12 @@ PATCHES = {
     "compiled_criterion_forward": _apply_compiled_criterion_forward,
     "nvtx": _apply_nvtx,
     "parallel_lap": _apply_parallel_lap,
+    "cuda_lap": _apply_cuda_lap,
+    "device_indices": _apply_device_indices,
+    "compile_backbone": _apply_compile_backbone,
+    "static_compile": _apply_static_compile,
+    "compile_blocks": _apply_compile_blocks,
+    "fused_msda": _apply_fused_msda,
     "triton_msda": _apply_triton_msda,
     "stacked_costs": _apply_stacked_costs,
 }
