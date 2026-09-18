@@ -1,6 +1,7 @@
 # Making an RF-DETR fine-tune 3.3× faster
 
-**[→ Interactive report with charts](https://tuan3w.github.io/rfdetr-training-throughput/)**
+**[→ Interactive report with charts](https://tuan3w.github.io/rfdetr-training-throughput/)** ·
+**[→ Full session history](https://tuan3w.github.io/rfdetr-training-throughput/history.html)**
 
 A single-GPU [RF-DETR](https://github.com/roboflow/rf-detr) Medium person/face fine-tune ran at
 **10.4 images/second** — 4h23m per epoch, ~18 days for its configured 100 epochs. After a measurement-driven
@@ -17,6 +18,12 @@ same multi-scale set, same effective batch, same augmentation stack, same EMA.
 
 Everything below was measured, never assumed. Negative results are included because they are the expensive
 part — and one of them overturned an earlier conclusion of this same report.
+
+The complete working session — every command, every tool result, every wrong turn, in order — is published as
+[`history.html`](https://tuan3w.github.io/rfdetr-training-throughput/history.html) (1,600 entries). It is
+redacted by `export_session.py`, which drops known secret-bearing environment values, rewrites token shapes
+(Atlassian, OpenRouter, Figma, generic 32-hex keys, `user:password@host` URLs) and maps internal hosts, paths
+and names to neutral ones. The exporter re-scans its own output and refuses to write on a leak.
 
 ---
 
