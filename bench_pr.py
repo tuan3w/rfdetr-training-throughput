@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
         help="Patch list for the baseline side; use this instead of the tree arguments to A/B lab patches.",
     )
     parser.add_argument("--after-patch", help="Patch list for the changed side.")
+    parser.add_argument("--matcher", default="scipy", help="Matcher solver selection passed to both sides.")
     parser.add_argument("--python", type=Path, required=True, help="Interpreter with the package's dependencies.")
     parser.add_argument("--dataset-dir", type=Path, default=Path("data/subset"))
     parser.add_argument("--rounds", type=int, default=3, help="Before/after pairs to run.")
@@ -85,6 +86,8 @@ def run_cell(args: argparse.Namespace, label: str, source: Path | None, patch: s
             str(args.resolution),
             "--multi-scale",
             str(args.multi_scale),
+            "--matcher",
+            args.matcher,
             "--patch",
             patch,
             "--result-file",

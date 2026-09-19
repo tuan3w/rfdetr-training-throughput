@@ -296,7 +296,7 @@ one and confirmed the other**:
 
 | claim | as published | paired re-audit | verdict |
 |---|---|---|---|
-| **GPU LAP solver** | +20.9% | 33.20 → 39.65 img/s; rounds +17.08, +20.86, +24.39, +5.87 %; median **+18.97%** | **confirmed** |
+| **GPU LAP solver** | +20.9% | 33.20 → 39.65 img/s; rounds +17.08, +20.86, +24.39, +5.87 %; median **+18.97%** | **speedup confirmed, credit reassigned** (below) |
 | device-side unpacking | +3.1% | 36.76 → 37.68 img/s, median **+1.09%** (3 up, 3 down); +0.43, +3.21, −1.11 % in the multi-scale recipe | **retired** |
 
 The benchmark harness's own `repeat_spread_pct` is what misled me: its two repeats are processes started
@@ -327,6 +327,30 @@ with 0.5–2% spread — orders of magnitude clear of the noise — and the larg
 specifically the low-single-digit attributions that single runs could not support, and those are now labelled
 as such. The lesson is cheap to state and was expensive to learn: on this box, identical code re-measures
 with up to 12% spread, so anything under ~5% needs alternating paired rounds or it needs no claim at all.
+
+### The solver speedup is real; the custom kernel is not what earns it
+
+The +19% stands, but look at what it beats: SciPy on eight threads, which this lab runs *only* because its
+frozen live configuration inherits the production script's `--matcher scipy` Xid workaround. rf-detr already
+solves on the GPU by default on CUDA — [#1368](https://github.com/roboflow/rf-detr/pull/1368), *"linear
+assignment solver with Triton"* — and measured against that, a hand-written CUDA port of SciPy's
+`rectangular_lsap` is a wash:
+
+| solver | img/s | note |
+|---|---:|---|
+| 8-thread SciPy (the workaround's path) | 33.20 | what the live config forces |
+| custom CUDA kernel | 41.94 | ~400 lines, verified exact |
+| **the dependency's Triton solver** | **41.75** | **−0.30% vs the kernel**, spreads 0.26/0.27 |
+
+Kernel-level the custom solver is 1.88× at 12 targets and 1.29× at 108 — but **0.61× at 219**, and the whole
+operation is sub-millisecond against a ~200 ms step (one batched call per step). Two host syncs the dependency
+performs per call (a NaN scan and an infeasibility `.item()`, both redundant with the matcher's own single
+batched finiteness read) were measured too: removing them is **−0.48%**, i.e. nothing.
+
+So this is a **configuration** finding, not a kernel one: **the forced-SciPy workaround costs ~26%, and the
+fix is to stop forcing it.** No custom kernel required, and nothing here worth sending upstream — they
+shipped it already. The kernel stays in the tree because it is written and verified exact, not because it
+earns its keep.
 
 ## How much headroom is left
 
