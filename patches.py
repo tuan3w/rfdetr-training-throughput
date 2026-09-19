@@ -669,6 +669,38 @@ def _apply_bicubic_meta() -> str:
     return "bicubic_meta: registered the missing _upsample_bicubic2d_aa_backward meta"
 
 
+def _sdpa_only(flash: bool, mem_efficient: bool, cudnn: bool, label: str) -> str:
+    """Restrict SDPA to one backend so the choice can be measured, not assumed.
+
+    ``sdpa=auto`` enables flash, mem-efficient and cuDNN and lets torch pick;
+    it picks flash, and flash's backward is ~19 ms/step here (1271 us per call,
+    the second largest kernel after the GEMMs). Whether that is the best
+    available on this card is a question nobody has asked.
+    """
+    import torch
+
+    torch.backends.cuda.enable_flash_sdp(flash)
+    torch.backends.cuda.enable_mem_efficient_sdp(mem_efficient)
+    torch.backends.cuda.enable_cudnn_sdp(cudnn)
+    torch.backends.cuda.enable_math_sdp(True)  # keep the fallback reachable
+    return f"sdpa_{label}: flash={flash} mem_efficient={mem_efficient} cudnn={cudnn}"
+
+
+def _apply_sdpa_cudnn() -> str:
+    """Use cuDNN's fused attention instead of flash."""
+    return _sdpa_only(flash=False, mem_efficient=False, cudnn=True, label="cudnn")
+
+
+def _apply_sdpa_mem_efficient() -> str:
+    """Use the mem-efficient (xformers-style) kernel instead of flash."""
+    return _sdpa_only(flash=False, mem_efficient=True, cudnn=False, label="mem_efficient")
+
+
+def _apply_sdpa_flash() -> str:
+    """Pin flash explicitly, as the control for the other two."""
+    return _sdpa_only(flash=True, mem_efficient=False, cudnn=False, label="flash")
+
+
 PATCHES = {
     "cdist_l1": _apply_cdist_l1,
     "pinned_d2h": _apply_pinned_d2h,
@@ -680,6 +712,9 @@ PATCHES = {
     "cuda_lap": _apply_cuda_lap,
     "device_indices": _apply_device_indices,
     "bicubic_meta": _apply_bicubic_meta,
+    "sdpa_cudnn": _apply_sdpa_cudnn,
+    "sdpa_mem_efficient": _apply_sdpa_mem_efficient,
+    "sdpa_flash": _apply_sdpa_flash,
     "compile_backbone": _apply_compile_backbone,
     "static_compile": _apply_static_compile,
     "compile_blocks": _apply_compile_blocks,

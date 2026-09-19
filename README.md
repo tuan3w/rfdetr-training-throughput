@@ -288,6 +288,23 @@ already right: `pack_targets`, 16 workers, thread pinning, `expandable_segments:
 On the shared A100, the stack measured 10.04 → 16.70 img/s (**+66%**) even while time-slicing with the
 co-tenant, before the solver work existed.
 
+## How much headroom is left
+
+At **89–90% device busy** the step is GPU-bound, so anything further must remove device work. Each candidate
+was checked against its ceiling instead of assumed:
+
+| lever | measured | verdict |
+|---|---|---|
+| GEMM efficiency | **95–101% of this card's measured bf16 ceiling** (45.9 TFLOPS on an 8192³ probe) on every production shape | nothing to win from layout or tiling |
+| SDPA backend | flash 42.23, cuDNN 41.57, mem-efficient 41.24, auto 41.40 img/s | torch already picks the best |
+| no-op `masked_fill` | all 16 deformable-attention calls per step get an all-`False` padding mask; skipping it saves **0.68 ms of ~181 ms** | 0.4%, not worth it |
+| fused deformable-attention CUDA kernel | 2.75–3.51× on the operator, −2.4% end to end | lost Inductor fusion costs more |
+| **fp8 GEMMs** (Blackwell) | **1.6–2.3×** on the production shapes; GEMMs are ~37% of device time → **~15–20% end to end** | the only large lever left — changes numerics, needs mAP validation |
+
+So this recipe sits within roughly 10% of its hardware envelope on this GPU, and that last 10% is launch
+latency from the eager model graph. The honest next steps are a precision change (fp8, with accuracy work) or
+a bigger GPU — batch 16 already wins on the A100 and loses here.
+
 ## Where the remaining time goes
 
 The device is now **85.4% busy** (from 69.9%), so the step is genuinely GPU-bound and host-side work has
