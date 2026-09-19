@@ -36,7 +36,7 @@ footer { margin-top: 32px; color: #6b7482; font-size: 12px; }
 </style></head>
 <body>
 <h1>Improve RF-DETR training performance</h1>
-<p class="sub">Session replay · 61 human turns · 353 agent replies · 1186 tool calls</p>
+<p class="sub">Session replay · 61 human turns · 354 agent replies · 1189 tool calls</p>
 <div class="bar"><span class="chip">12.81 → 33.63 img/s (2.63×)</span><span class="chip">24 logged experiments</span><span class="chip">2 custom Triton kernels</span><span class="chip">profiler → Nsight → NVTX</span></div>
 <div class="notice"><strong>Redacted export.</strong> API tokens, credentials, internal hostnames, ssh
 aliases, home paths and dataset names were replaced before rendering, and recalled-memory blocks were
@@ -20104,6 +20104,61 @@ Recording it and refreshing the published report.</div></div><details class="too
 
 Wall time: 0.10 seconds</pre></details><details class="tool"><summary><span class="name">bash</span> — Updating report with verified finding</summary><pre>{
  &quot;command&quot;: &quot;cd ~/workspace/rfdetr-perf-lab &amp;&amp; python3 - &lt;&lt;&#x27;PY&#x27;\nimport pathlib\np = pathlib.Path(\&quot;lab/export_report.py\&quot;)\ns = p.read_text()\nold = \&quot;\&quot;\&quot;On the 108-SM A100 \u2014 where autotuning is available and compile did help in the cross-check (14.82 &amp;rarr;\n15.99 img/s) \u2014 a compiled backbone may well win, and nobody can find out while the resize rejects the graph.\nThat is the argument for reporting it upstream.\&quot;\&quot;\&quot;\nnew = \&quot;\&quot;\&quot;&lt;p&gt;Supplying the meta kernel torch is missing settles it end to end. The graph is then accepted -- seven\nfailing compile ids become &lt;strong&gt;zero&lt;/strong&gt;, and the compiled dynamic backward matches eager bit-exactly\non the output and to 6e-07 on the gradient -- and against a matched control the compiled backbone is\n&lt;strong&gt;32.27 vs 35.51 img/s, -9.1%&lt;/strong&gt;, agreeing with the 0.60x encoder figure. (Both rows use 4\ndataloader workers rather than the kept 16, because the symbolic-shape compile otherwise does not fit in RAM\nand &lt;code&gt;systemd-oomd&lt;/code&gt; kills the run.)&lt;/p&gt;\n&lt;p&gt;On the 108-SM A100 \u2014 where autotuning is available and compile did help in the cross-check (14.82 &amp;rarr;\n15.99 img/s) \u2014 a compiled backbone may well win, and nobody can find out while the resize rejects the graph.\nThat is the argument for reporting it upstream, filed as\n&lt;a href=\&quot;https://github.com/pytorch/pytorch/issues/197622\&quot;&gt;pytorch/pytorch#1
-… [401 more characters]</pre></details>
-<footer>exported from 2026-09-18T04-46-26-967Z_01a0b2d6-5897-72e8-8e83-375e59008687.jsonl · 1983 entries</footer>
+… [401 more characters]</pre><pre>report updated
+file://~/workspace/rfdetr-perf-lab/results/report.html
+file://~/workspace/rfdetr-perf-lab/results/session-replay.html
+
+
+Wall time: 0.98 seconds</pre></details><details class="tool"><summary><span class="name">bash</span> — Updating published README and scanning</summary><pre>{
+ &quot;command&quot;: &quot;cd ~/workspace/rfdetr-perf-lab &amp;&amp; python3 - &lt;&lt;&#x27;PY&#x27;\nimport pathlib\np = pathlib.Path(\&quot;/tmp/pub/README.md\&quot;)\ns = p.read_text()\nold = \&quot;\&quot;\&quot;So on this GPU the upstream bug costs nothing. On the 108-SM A100, where autotuning is available and compile\ndid help in the cross-check (14.82 \u2192 15.99 img/s), a compiled backbone may well win \u2014 and nobody can find\nout while the resize silently rejects the graph. That is the argument for reporting it upstream.\&quot;\&quot;\&quot;\nnew = \&quot;\&quot;\&quot;Supplying the meta kernel torch is missing settles it end to end. The graph is then accepted \u2014 **seven\nfailing compile ids become zero** \u2014 and the compiled dynamic backward matches eager bit-exactly on the output\nand to 6e-07 on the gradient. Against a matched control:\n\n| backbone | img/s |\n|---|---:|\n| eager | **35.51** |\n| compiled | **32.27** (\u22129.1%) |\n\nBoth rows use 4 dataloader workers instead of the kept 16, because the symbolic-shape compile otherwise does\nnot fit in RAM on this host and `systemd-oomd` kills the run. (The loader ceiling at 4 workers is 159.6 img/s\nagainst ~42 consumed, so the loader is not the limiter \u2014 though both rows sitting below the 16-worker 41.93\nshows that ceiling test overstates how few workers suffice, since it does not model the loader competing with\nthe training process for CPU.)\n\nSo on this GPU the upstream bug costs
+… [1522 more characters]</pre><pre>README updated
+user                       0
+teammate                         0
+~/project                0
+ATATT3[A-Za-z0-9]              3
+figd_[A-Za-z0-9]               3
+sk-[A-Za-z0-9]{16,}            0
+
+
+Wall time: 0.10 seconds</pre></details><details class="tool"><summary><span class="name">bash</span> — Verifying remaining hits benign</summary><pre>{
+ &quot;command&quot;: &quot;cd /tmp/pub &amp;&amp; grep -rEio --exclude-dir=.git -l \&quot;ATATT3[A-Za-z0-9]|figd_[A-Za-z0-9]\&quot; . ; grep -oE \&quot;.{40}(ATATT3|figd_)[A-Za-z0-9_-]{0,10}\&quot; history.html | head -3&quot;,
+ &quot;i&quot;: &quot;Verifying remaining hits benign&quot;,
+ &quot;timeout&quot;: 180
+}</pre><pre>./history.html
+;&amp;amp; grep -c -E \&amp;quot;ATATT|sk-or-v1|figd_
+ grep -o -E \&amp;quot;.{60}(ATATT|sk-or-v1|figd_
+ in ATATT \&amp;quot;sk-or-v1\&amp;quot; \&amp;quot;figd_
+
+
+Wall time: 0.01 seconds</pre></details><details class="tool"><summary><span class="name">bash</span> — Publishing updated report</summary><pre>{
+ &quot;command&quot;: &quot;cd /tmp/pub &amp;&amp; git add -A &amp;&amp; git -c user.email=lab@local -c user.name=tuan3w commit -qm \&quot;verify the missing bicubic meta and measure the compiled backbone end to end (-9.1%); link pytorch#197622\&quot; &amp;&amp; GIT_SSH_COMMAND=\&quot;ssh -o StrictHostKeyChecking=accept-new\&quot; git push -q origin HEAD &amp;&amp; git log --oneline -1&quot;,
+ &quot;i&quot;: &quot;Publishing updated report&quot;,
+ &quot;timeout&quot;: 600
+}</pre><pre>8002379 verify the missing bicubic meta and measure the compiled backbone end to end (-9.1%); link pytorch#197622
+
+
+Wall time: 4.62 seconds</pre></details><div class="entry assistant"><div class="role">agent</div><div class="text">No — nothing on your PC needs killing, and I didn&#x27;t touch it.
+
+**What was holding RAM:** McAfee EDR `mvedrtrace` **5.1 GB** (root, respawns, corporate), Cloudflare `warp-svc`, Brave, and **~6 GB across nine stale `omp` agent sessions aged 13–43 h**. Only those last ones are arguably disposable, and they&#x27;re yours with possible conversation state — so I left them alone and solved it inside our own run instead: 16 → 4 dataloader workers, after verifying the loader ceiling at 4 workers is **159.6 img/s** against ~42 consumed.
+
+## The answer you wanted
+
+| backbone | img/s |
+| --- | --- |
+| eager (control) | **35.51** |
+| compiled, with the meta fix | **32.27** — **−9.1%** |
+
+So the chain is now complete and every link measured:
+
+1. `_upsample_bicubic2d_aa_backward` has no Python meta → internal assert under `dynamic=True`
+2. → all 7 model compile ids fail, `suppress_errors=True` hides it, backbone runs eager
+3. → supplying the meta makes it compile (**7 failures → 0**, output bit-identical, grads to 6e-7)
+4. → and the compiled backbone is **9.1% slower here**, matching the 0.60× encoder bench
+
+**The upstream bug costs this GPU nothing — it&#x27;s accidentally load-bearing.** The fix matters for the 108-SM A100, where autotuning is available and compile did help (+8% in the cross-check).
+
+One honest correction to my own earlier reasoning: both rows sit below the kept config&#x27;s 41.93 img/s at 16 workers, so the loader-ceiling test **overstates** how few workers suffice — it measures the loader in isolation, not competing with the training process for CPU. That&#x27;s now written down rather than glossed.
+
+**Published:** report + README + history at `8002379`, linking pytorch#197622. Lab at `3824045`. Leak scan clean (the `ATATT3`/`figd_` hits are my own grep patterns in the transcript, no token characters). No processes left running.</div></div>
+<footer>exported from 2026-09-18T04-46-26-967Z_01a0b2d6-5897-72e8-8e83-375e59008687.jsonl · 1987 entries</footer>
 </body></html>

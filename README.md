@@ -221,45 +221,42 @@ Both produced confident, wrong numbers before being caught:
 
 ## Is the missing backbone compile actually a loss?
 
-The `compile=True` bug above means the backbone runs eager — but whether that costs anything needed
-measuring, not assuming. Timing the DINOv2 encoder alone at a fixed 576px, batch 8, forward and backward:
+Two answers, because the first was wrong — and the way it was wrong is the more useful lesson.
 
-| | ms | |
-|---|---|---|
-| eager encoder | **36.5** | |
-| compiled encoder (`dynamic=False`) | **60.6** | **0.60×** |
+**The retracted claim.** An earlier version of this report said the compiled encoder measured 0.60×, i.e.
+that the bug costs nothing. That was a benchmark bug. The loss was taken from `features[0]`, but this encoder
+returns one feature map per `out_feature_indexes` layer, so the gradient only reached the layers feeding the
+earliest map. Eager ran **3 attention backwards against 12 forwards** — 0.55× the forward's GEMM calls —
+while the compiled graph computed all 12 (2.14×). The two sides were doing different amounts of work. The
+tell was there all along: the *forward alone* was already faster compiled (14.48 vs 16.22 ms of GEMM time),
+which no "compile is slower" story explains.
 
-Reproduced within 0.2 ms across three fresh processes. Nothing exotic is lost — bf16 cutlass GEMM time simply
-doubles (15.0 → 29.3 ms) — and Inductor logs *"Not enough SMs to use max_autotune_gemm mode"* on this 24-SM
-card, so its unautotuned GEMM choices lose to cuBLAS's heuristics.
+**The corrected measurement.** With the loss summed over every returned map, it depends entirely on the
+compile mode:
 
-Supplying the meta kernel torch is missing settles it end to end. The graph is then accepted — **seven
-failing compile ids become zero** — and the compiled dynamic backward matches eager bit-exactly on the output
-and to 6e-07 on the gradient. Against a matched control:
+| encoder, batch 8 @ 576px, fwd+bwd | ms | vs eager |
+|---|---:|---|
+| eager | 80.4 | — |
+| compiled, `dynamic=False` | **64.5** | **1.25× faster** |
+| compiled, `dynamic=True` (what rf-detr uses) | **85.2** | **0.94× slower** |
 
-| backbone | img/s |
-|---|---:|
-| eager | **35.51** |
-| compiled | **32.27** (−9.1%) |
+End to end this holds. With the missing meta supplied so the backbone genuinely compiles (7 failing compile
+ids → **0**, output bit-identical, gradients to 6e-7): **37.50 img/s against 44.08 for the eager control,
+−14.9%** (16 workers, warm Inductor cache, 60 warm-up steps). Paired Nsight traces put the cost on
+Inductor's codegen rather than the backbone's math — triton kernel time **125.9 → 222.6 ms** per 1.2 s window
+(+596 calls) and GEMM +24.7 ms, against elementwise −14.6 ms.
 
-Both rows use 4 dataloader workers instead of the kept 16, because the symbolic-shape compile otherwise does
-not fit in RAM on this host and `systemd-oomd` kills the run. (The loader ceiling at 4 workers is 159.6 img/s
-against ~42 consumed, so the loader is not the limiter — though both rows sitting below the 16-worker 41.93
-shows that ceiling test overstates how few workers suffice, since it does not model the loader competing with
-the training process for CPU.)
+So on this hardware the upstream bug is currently free, and the repair that would actually pay is the meta
+fix **plus static shapes** — which reintroduces the 8 per-resolution compiles that ruled `dynamic=False` out
+above. That tension, not the bug itself, is the real finding.
 
-So on this GPU the upstream bug costs nothing — it is arguably load-bearing. On the 108-SM A100, where
-autotuning is available and compile did help in the cross-check (14.82 → 15.99 img/s), a compiled backbone may
-well win, and nobody can find out while the resize silently rejects the graph.
-
-Root cause and fix, filed upstream as
-[pytorch/pytorch#197622](https://github.com/pytorch/pytorch/issues/197622): `_upsample_bicubic2d_aa_backward`
-is missing from the `register_meta` list in `torch/_meta_registrations.py` that already covers the bilinear
-and lanczos equivalents, so with a symbolic output size it reaches the C++ structured kernel and `isIntList()`
-fires an internal assert. Still missing on `main`; 2.14.0 is the latest release and is affected. Verified
-locally that adding it is sufficient — note the registration has to go through
-`op.py_impl(DispatchKey.Meta)`, the way `activate_meta()` wires it at import, since `register_meta` only fills
-a table that has already been read by then.
+Root cause, filed as [pytorch/pytorch#197622](https://github.com/pytorch/pytorch/issues/197622):
+`_upsample_bicubic2d_aa_backward` is missing from the `register_meta` list in `torch/_meta_registrations.py`
+that already covers the bilinear and lanczos equivalents, so with a symbolic output size it reaches the C++
+structured kernel and `isIntList()` fires an internal assert. Still missing on `main`; 2.14.0 is the latest
+release and is affected. Verified locally that adding it is sufficient — the registration has to go through
+`op.py_impl(DispatchKey.Meta)`, the way `activate_meta()` wires it at import, since `register_meta` only
+fills a table that has already been read by then.
 
 ## Correctness
 

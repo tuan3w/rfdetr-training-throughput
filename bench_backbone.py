@@ -31,6 +31,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolution", type=int, default=576)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--reps", type=int, default=10)
+    parser.add_argument(
+        "--dynamic",
+        type=int,
+        default=0,
+        help=(
+            "Compile with dynamic=True (1) or dynamic=False (0). rfdetr uses dynamic=True so one "
+            "graph serves all multi-scale sizes, which is a different codegen regime."
+        ),
+    )
     parser.add_argument("--gpu", type=int, default=0)
     return parser.parse_args()
 
@@ -86,14 +95,18 @@ def main() -> int:
             module.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 features = module(pixels)
-            # Only the final hidden state: the encoder also returns every
-            # intermediate layer, and building a loss over all of them measured
-            # 1551 ms by back-propagating through the stack 16 times over.
-            output = getattr(features, "last_hidden_state", None)
-            if output is None:
-                output = features[0] if isinstance(features, (list, tuple)) else features
-            output = getattr(output, "tensors", output)
-            loss = output.float().pow(2).mean()
+            # Every returned feature map, not just the first. This encoder hands
+            # back one map per `out_feature_indexes` layer, so a loss on
+            # `features[0]` only back-propagates through the layers feeding the
+            # earliest map: eager then ran 3 attention backwards against 12
+            # forwards, and compared against a compiled graph that computed all
+            # 12 the comparison was measuring unequal work.
+            maps = features if isinstance(features, (list, tuple)) else [features]
+            tensors = [getattr(item, "tensors", item) for item in maps]
+            tensors = [item for item in tensors if torch.is_tensor(item)]
+            if not tensors:
+                raise RuntimeError(f"no tensors in backbone output of type {type(features).__name__}")
+            loss = sum(tensor.float().pow(2).mean() for tensor in tensors)
             loss.backward()
             return loss
 
@@ -103,7 +116,7 @@ def main() -> int:
     print(f"eager encoder       : {eager_ms:8.2f} ms  (batch {args.batch_size}, {args.resolution}px)")
 
     compile_started = time.perf_counter()
-    compiled = torch.compile(backbone, dynamic=False)
+    compiled = torch.compile(backbone, dynamic=bool(args.dynamic))
     try:
         step(compiled)()
     except Exception as error:  # noqa: BLE001 - reporting is the point
@@ -112,7 +125,10 @@ def main() -> int:
     compile_seconds = time.perf_counter() - compile_started
     compiled_ms = timed(step(compiled), args.reps)
 
-    print(f"compiled encoder    : {compiled_ms:8.2f} ms  ({eager_ms / compiled_ms:.2f}x)")
+    print(
+        f"compiled encoder    : {compiled_ms:8.2f} ms  ({eager_ms / compiled_ms:.2f}x)  "
+        f"dynamic={bool(args.dynamic)}"
+    )
     print(f"one-off compile     : {compile_seconds:8.1f} s for this single resolution")
     saving = (eager_ms - compiled_ms) / 1e3
     if saving > 0:
