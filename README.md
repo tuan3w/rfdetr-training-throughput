@@ -290,8 +290,18 @@ co-tenant, before the solver work existed.
 
 ## A correction: two claims that single runs could not support
 
-Two numbers here were produced by single gated runs, and a paired alternating protocol later retired one of
-them.
+Two numbers here were produced by single gated runs. A paired alternating protocol — switching configuration
+between *every* run, so drift lands on both sides — was built later and used to re-audit them. It **retired
+one and confirmed the other**:
+
+| claim | as published | paired re-audit | verdict |
+|---|---|---|---|
+| **GPU LAP solver** | +20.9% | 33.20 → 39.65 img/s; rounds +17.08, +20.86, +24.39, +5.87 %; median **+18.97%** | **confirmed** |
+| device-side unpacking | +3.1% | 36.76 → 37.68 img/s, median **+1.09%** (3 up, 3 down); +0.43, +3.21, −1.11 % in the multi-scale recipe | **retired** |
+
+The benchmark harness's own `repeat_spread_pct` is what misled me: its two repeats are processes started
+seconds apart and agree to 0.2–2%, but the *same* configuration re-measured across separate harness runs spans
+**40.86–42.14 img/s**. A 3% gap between two such runs sits inside that envelope; a 19% one does not.
 
 **Device-side unpacking was published at +3.1%** (from the readings 40.67 → 41.93 img/s). Measured properly —
 six alternating compiled rounds of 60 steps, switching configuration between *every* run — it is:
