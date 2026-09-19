@@ -597,6 +597,44 @@ def _apply_fused_msda() -> str:
     return "fused_msda: deformable attention uses the fused CUDA kernel (3.9-5.0x standalone)"
 
 
+def _apply_fused_msda_native() -> str:
+    """Reach the fused deformable-attention kernel without any layout copy.
+
+    ``fused_msda`` replaced only the core, so the module still built
+    ``[batch, heads, head_dim, sequence]`` and the kernel had to permute it back;
+    it was 2.4% slower end to end despite being faster standalone. Measured at
+    the module level (``lab/bench_msda.py``, autocast bf16, production geometry),
+    the copy is a real cost:
+
+        decoder  300 queries: upstream 2.75 ms  ->  1.18 ms copied  ->  1.03 ms native
+        encoder 1701 queries: upstream 12.69 ms ->  3.74 ms copied  ->  3.61 ms native
+
+    This replaces ``MSDeformAttn.forward`` itself, so ``value_proj``'s output
+    reaches the kernel through a free ``view``. Output matches upstream to
+    3.9e-03 -- the bf16 quantum of the final projection -- and gradients to
+    4.8e-07.
+
+    The replacement handles only the eager branch; export mode and any call with
+    rank-5 sampling locations fall back to the upstream forward. It duplicates
+    upstream's sampling-location arithmetic, so it is pinned to rfdetr 1.10.1 and
+    is checked against the real module by ``lab/bench_msda.py``.
+    """
+    from rfdetr.models.ops.modules.ms_deform_attn import MSDeformAttn
+
+    from lab.kernels_msda_cuda import kernel, module_forward
+
+    kernel()  # surface a download or ABI problem here rather than mid-step
+    original = MSDeformAttn.forward
+
+    def forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if getattr(self, "_export", False):
+            return original(self, *args, **kwargs)
+        return module_forward(self, *args, **kwargs)
+
+    MSDeformAttn.forward = forward  # type: ignore[method-assign]
+    return "fused_msda_native: deformable attention kernel reached without a layout copy"
+
+
 PATCHES = {
     "cdist_l1": _apply_cdist_l1,
     "pinned_d2h": _apply_pinned_d2h,
@@ -611,6 +649,7 @@ PATCHES = {
     "static_compile": _apply_static_compile,
     "compile_blocks": _apply_compile_blocks,
     "fused_msda": _apply_fused_msda,
+    "fused_msda_native": _apply_fused_msda_native,
     "triton_msda": _apply_triton_msda,
     "stacked_costs": _apply_stacked_costs,
 }

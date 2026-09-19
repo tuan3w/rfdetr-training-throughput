@@ -40,7 +40,7 @@ footer { margin-top: 40px; color: #6b7482; font-size: 12px; }
 </style></head>
 <body>
 <h1>RF-DETR Medium person/face fine-tune — training throughput</h1>
-<p class="sub">rfdetr-medium-person-face-throughput · 24 logged experiments · 107 measured cells · metric: images_per_s (img/s, higher is better)</p>
+<p class="sub">rfdetr-medium-person-face-throughput · 24 logged experiments · 115 measured cells · metric: images_per_s (img/s, higher is better)</p>
 <p class="sub"><a href="history.html">Full session history</a> — every command and tool result, in order,
 redacted by <code>export_session.py</code>.</p>
 
@@ -108,16 +108,30 @@ inner loop removes exactly one column per iteration, which bounds the augmenting
 built from the usual formulation, had no such bound and hung the GPU. Cost is roughly quadratic in target
 count (0.12 ms at 12 targets, 1.40 ms at 108, 76.8 ms at 300), but so is the host path it replaces, and the
 kernel wins at every size measured: 1.6 vs 48 ms at 128 targets, 7.0 vs 92 at 219, 76.8 vs 217 at 300.</p>
-<p><strong>Deformable attention (two attempts, neither kept).</strong> rf-detr runs deformable attention
-through the reference PyTorch decomposition, whose own docstring says <em>"For debug and test only, need to
-use cuda version instead"</em>, and no compiled extension is installed. Its fp32
-<code>grid_sampler_2d_backward</code> is the largest non-GEMM kernel in the profile (65.5 ms over 30 calls in
-a 1.4 s window). A fused Triton kernel was <strong>+2.9% eager but -4.0% under <code>compile</code></strong>.
-Routing it instead through the real Deformable-DETR CUDA kernel — fetched prebuilt from the Hugging Face
-kernels hub for this exact torch/CUDA build — is <strong>3.9-5.0x faster standalone</strong> and numerically
-equivalent, yet <strong>2.4% slower end to end</strong> (40.91 vs 41.93 gated): the kernel wants
-<code>[batch, sequence, heads, head_dim]</code> in fp32 while the caller hands it the transposed layout, and
-the permute-and-copy costs more than the faster backward saves.</p>
+<p><strong>Deformable attention (three attempts with the real CUDA kernel, none kept).</strong> rf-detr runs
+deformable attention through the reference PyTorch decomposition, whose own docstring says <em>"For debug and
+test only, need to use cuda version instead"</em>, and no compiled extension is installed
+(<code>import MultiScaleDeformableAttention</code> fails). Its fp32 <code>grid_sampler_2d_backward</code> is
+the largest non-GEMM kernel in the profile. A fused Triton kernel was +2.9% eager but -4.0% under
+<code>compile</code>; the real Deformable-DETR CUDA kernel — fetched prebuilt from the Hugging Face kernels
+hub for this exact torch/CUDA build — is far faster on the operator yet does not move the step time:</p>
+<table>
+<thead><tr><th>variant</th><th class="num">decoder 300 q</th><th class="num">encoder 1701 q</th><th>end to end</th></tr></thead>
+<tbody>
+<tr><td>upstream <code>grid_sample</code> fallback</td><td class="num">2.76 ms</td><td class="num">12.70 ms</td><td>—</td></tr>
+<tr><td>kernel, upstream's layout</td><td class="num">1.19 ms (2.32x)</td><td class="num">3.75 ms (3.39x)</td><td>40.91 vs 41.93 gated</td></tr>
+<tr><td>kernel, native layout (free view)</td><td class="num">1.00 ms (2.75x)</td><td class="num">3.62 ms (3.51x)</td><td>41.15 vs 41.72 gated</td></tr>
+<tr><td>kernel as a <code>torch.library.custom_op</code></td><td class="num">same</td><td class="num">same</td><td>38.67 vs 42.75</td></tr>
+</tbody>
+</table>
+<p>Paired Nsight traces say why, and it is not the kernel: per 1.2 s window it replaces 59.7 ms of
+<code>grid_sampler</code> with 41.7 ms of <code>im2col</code>/<code>col2im</code>, but aten layer-norm
+kernels around the attention block go from 24 to 48-54 calls (<strong>+16.9 ms</strong>) and cast kernels add
+12.8 ms — the opaque call splits an Inductor-fused region, and the fp32 conversions its contract requires are
+no longer fused either. Registering it as a custom op, the textbook fix for a graph break, was worse again.
+The conclusion is about this model rather than the kernel: while the decoder region is compiled, any opaque
+deformable-attention implementation loses more to lost fusion than a 2.7-3.5x operator speedup returns. It
+becomes worth keeping if the model is ever compiled end to end, or in an eager configuration (+2.4%).</p>
 
 <h3>The two surprises</h3>
 <p><strong>The solver did belong on the GPU after all.</strong> NVTX attribution showed the host spending
@@ -142,11 +156,19 @@ that window is ~3.5 ms.</p>
 <code>Expected IntList but got GenericList</code> from <code>_upsample_bicubic2d_aa_backward</code>. The
 DINOv2 positional-embedding resize gets a symbolic output size because rf-detr compiles with
 <code>dynamic=True</code>, and the antialiased-bicubic backward cannot accept one; <code>suppress_errors=True</code>
-then hides the failure and the dominant compute runs eager. Every <code>compile=True</code> user loses the
-backbone. Three repairs were tried and all cost more than they return: disabling Dynamo for just that resize
-makes inductor attempt the real graph (22 minutes on one frame, GPU idle, one core pinned on sympy shape
-reasoning over an ~800 KB FX graph); <code>dynamic=False</code> compiles at 2-3 min per resolution across 8
-multi-scale sizes; compiling each DINOv2 block separately measured 43.17 against 45.24 img/s.</p>
+then hides the failure and the dominant compute runs eager.</p>
+<p>Whether that is a loss depends on the GPU, which took a direct measurement to settle. Timing the DINOv2
+encoder alone at a fixed 576px, batch 8, forward and backward: <strong>eager 36.5 ms versus compiled
+60.6 ms — 0.60x</strong>, reproduced within 0.2 ms across three fresh processes. Nothing exotic is lost;
+bf16 cutlass GEMM time simply doubles (15.0 &rarr; 29.3 ms), and Inductor reports <em>"Not enough SMs to use
+max_autotune_gemm mode"</em> on this 24-SM card, so its unautotuned GEMM choices lose to cuBLAS's heuristics.
+On the 108-SM A100 — where autotuning is available and compile did help in the cross-check (14.82 &rarr;
+15.99 img/s) — a compiled backbone may well win, and nobody can find out while the resize rejects the graph.
+That is the argument for reporting it upstream. The three repairs tried here all cost more than they return:
+disabling Dynamo for just the resize makes Inductor attempt the real graph (22 minutes on one frame, GPU
+idle, one core pinned on sympy shape reasoning over an ~800 KB FX graph); <code>dynamic=False</code> compiles
+at 2-3 min per resolution across 8 multi-scale sizes; per-block compilation measured 43.17 against
+45.24 img/s.</p>
 
 <h2>Correctness</h2>
 <p>A faster kernel that is subtly wrong would quietly damage training, so each was held to the behaviour a
@@ -192,5 +214,5 @@ cutlass GEMMs hold the top three entries at 138/125/75 ms per 1.4 s window.</p>
 <tbody><tr><td class="num">1</td><td class="keep">keep</td><td class="num strong">12.81</td><td class="num">624</td><td class="num">5.91</td><td>Baseline: live A100 config (math SDPA, non-fused AdamW, grad-ckpt, SciPy matcher, b8xa4, 16 workers, 1 thread, live Albumentations)</td></tr><tr><td class="num">2</td><td class="keep">keep</td><td class="num strong">20.69</td><td class="num">387</td><td class="num">4.51</td><td>sdpa=auto: fused flash/mem-efficient attention instead of the math-only workaround</td></tr><tr><td class="num">3</td><td class="keep">keep</td><td class="num strong">20.96</td><td class="num">382</td><td class="num">4.50</td><td>fused_opt=1 on top of fused SDPA: +1.3%, inside local noise (A100 measured 1.20x when launch-bound)</td></tr><tr><td class="num">4</td><td class="drop">discard</td><td class="num strong">21.02</td><td class="num">381</td><td class="num">4.48</td><td>torch_threads=4 in the main process: +0.3%, pure noise — thread pinning is not a bottleneck</td></tr><tr><td class="num">5</td><td class="drop">discard</td><td class="num strong">20.76</td><td class="num">771</td><td class="num">8.54</td><td>batch 16 x accum 2: -1% locally (this GPU already saturates at batch 8); input gap fell 14.3% -&gt; 6.0%</td></tr><tr><td class="num">6</td><td class="drop">discard</td><td class="num strong">20.52</td><td class="num">390</td><td class="num">4.48</td><td>aug fused into one Sequential wrapper: -2% (noise), input gap unchanged 14.3-&gt;14.4% — the 6 wrappers are not a cost</td></tr><tr><td class="num">7</td><td class="keep">keep</td><td class="num strong">22.25</td><td class="num">360</td><td class="num">7.26</td><td>grad_ckpt=0: +6.1% over fused-SDPA best (22.25 img/s), peak 4.48 -&gt; 7.26 GiB</td></tr><tr><td class="num">8</td><td class="drop">discard</td><td class="num strong">22.44</td><td class="num">356</td><td class="num">7.41</td><td>ema_update_interval=4: +0.9%, noise — EMA foreach pass costs nothing at accum=4</td></tr><tr><td class="num">9</td><td class="keep">keep</td><td class="num strong">25.27</td><td class="num">317</td><td class="num">6.48</td><td>compile=True (Inductor, dynamic=True): +13.6% to 25.28 img/s and peak 7.26 -&gt; 6.48 GiB; ~11 min one-off warm-up</td></tr><tr><td class="num">10</td><td class="drop">discard</td><td class="num strong">23.10</td><td class="num">693</td><td class="num">12.09</td><td>batch 16 x accum 2 with compile: -8.6% locally, peak 12.09 GiB — confirms this GPU saturates at batch 8</td></tr><tr><td class="num">11</td><td class="drop">discard</td><td class="num strong">23.91</td><td class="num">335</td><td class="num">6.49</td><td>pack_targets=0: -5.4% and input gap 14.8 -&gt; 16.4% — packing is a real win, keep it on</td></tr><tr><td class="num">12</td><td class="drop">discard</td><td class="num strong">25.72</td><td class="num">311</td><td class="num">6.44</td><td>expandable_segments=1: +1.8%, noise — not worth reopening the torch 2.14+cu130 allocator bug the live config avoids</td></tr><tr><td class="num">13</td><td class="keep">keep</td><td class="num strong">25.28</td><td class="num">316</td><td class="num">6.49</td><td>Confirmation of best config after LIVE_CONFIG/KEPT refactor: 25.28 img/s, reproduces run #10 within 0.03%</td></tr><tr><td class="num">14</td><td class="keep">keep</td><td class="num strong">30.33</td><td class="num">264</td><td class="num">6.49</td><td>Fused Triton matcher cost kernel: +20.0% to 30.33 img/s (2.37x baseline); verified equivalent on real batches</td></tr><tr><td class="num">15</td><td class="drop">discard</td><td class="num strong">29.56</td><td class="num">271</td><td class="num">6.49</td><td>pinned_d2h staging for the matcher&#x27;s host transfer: -2.5%, noise — the blocking sync dominates, not the copy mechanics</td></tr><tr><td class="num">16</td><td class="drop">discard</td><td class="num strong">28.78</td><td class="num">417</td><td class="num">9.24</td><td>batch 12 x accum 3 with the fused kernel: -5.1% (28.78 vs 30.33) — larger microbatches still lose on this 24-SM GPU</td></tr><tr><td class="num">17</td><td class="drop">discard</td><td class="num strong">26.88</td><td class="num">299</td><td class="num">6.49</td><td>Reworked pinned_d2h (no clone, per-position buffers): 26.88 img/s with 11.3% repeat spread — no gain, and the host is noisier than the effect</td></tr><tr><td class="num">18</td><td class="keep">keep</td><td class="num strong">29.68</td><td class="num">270</td><td class="num">6.49</td><td>Re-confirmation of the kept stack over 2 repeats: 29.68 img/s, spread 1.6% (prior single-repeat reading was 30.33)</td></tr><tr><td class="num">19</td><td class="drop">discard</td><td class="num strong">30.16</td><td class="num">266</td><td class="num">6.49</td><td>workers 24 + prefetch 4: +1.6% inside 6.5% spread, and the gap stayed at 19% — the inter-batch gap is not loader-bound</td></tr><tr><td class="num">20</td><td class="drop">discard</td><td class="num strong">19.32</td><td class="num">415</td><td class="num">6.58</td><td>matcher=triton (GPU assignment solver): -35% (19.32 vs 29.68) — its solve kernel costs more than the host sync it removes</td></tr><tr><td class="num">21</td><td class="keep">keep</td><td class="num strong">33.63</td><td class="num">238</td><td class="num">6.49</td><td>parallel_lap: SciPy assignment sub-problems on an 8-thread pool — +13.3% to 33.63 img/s (2.63x baseline), spread 0.91%</td></tr><tr><td class="num">22</td><td class="drop">discard</td><td class="num strong">32.90</td><td class="num">486</td><td class="num">12.06</td><td>batch 16 x accum 2 with the parallel solver: -2.2% (32.90 vs 33.63); gap fell 21.8% -&gt; 12.4% but compute grew more</td></tr><tr><td class="num">23</td><td class="drop">discard</td><td class="num strong">32.28</td><td class="num">248</td><td class="num">6.23</td><td>triton_msda (fused deformable attention fwd+bwd): -4.0% under compile (32.28 vs 33.63), though +2.9% eager and -0.26 GiB peak</td></tr><tr><td class="num">24</td><td class="keep">keep</td><td class="num strong">31.36</td><td class="num">255</td><td class="num">6.49</td><td>Final confirmation of the kept stack: 31.36 img/s (spread 6.9%); kept best remains 33.63 from run #23, mean of confirmations ~32.5</td></tr></tbody>
 </table>
 
-<footer>generated 2026-09-19 06:16:12 · harness, kernels and verifiers in lab/ · raw per-run records in results/**/*.jsonl · interactive dashboard in results/dashboard.html · self-contained: no external assets</footer>
+<footer>generated 2026-09-19 07:06:01 · harness, kernels and verifiers in lab/ · raw per-run records in results/**/*.jsonl · interactive dashboard in results/dashboard.html · self-contained: no external assets</footer>
 </body></html>

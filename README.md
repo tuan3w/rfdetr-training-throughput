@@ -165,13 +165,77 @@ Three repairs were tried; all cost more than they return:
 |---|---|
 | rf-detr's GPU assignment solver | **−35%** — built for large square problems, not 520 tiny ones |
 | Fused Triton deformable attention | +2.9% eager, **−4.0% under `compile`** |
-| **Real Deformable-DETR CUDA kernel** (HF kernels hub) | **3.9–5.0× standalone, numerically equivalent, yet −2.4% end to end** (40.91 vs 41.93): it wants `[batch, sequence, heads, head_dim]` in fp32 while the caller hands it the transposed layout, and the permute-and-copy costs more than the faster backward saves |
+| **Real Deformable-DETR CUDA kernel**, three variants (HF kernels hub) | **2.75–3.51× on the operator, neutral end to end.** See below — the cause is lost Inductor fusion, not the kernel |
 | CUDA graphs | **OOM** — 12.3 GiB of private graph pools after 2 of 8 multi-scale shapes |
 | Batch 12 / 16 (tested 3×) | −1% to −8.6% locally; **+12.7% on the A100** (108 SMs vs 24) |
 | Pinned-memory host transfer (2 variants) | −16% to +2%, all noise |
 | Fusing the 6 augmentation wrappers into one | −2% — hidden by loader headroom |
 | `pack_targets=0` | −5.4% — the existing packing is a real win |
 | More workers / prefetch, thread counts, EMA interval, expandable segments | all within noise |
+
+
+## Testing the CUDA kernels properly
+
+The deformable-attention substitution deserved a second look, because the first attempt was rejected on a
+suspicion (a layout copy) rather than a measurement. Tested through the **real module** under the training
+loop's `autocast(bfloat16)`, at production geometry:
+
+| variant | decoder, 300 q | encoder, 1701 q | end to end |
+|---|---|---|---|
+| upstream `grid_sample` fallback | 2.76 ms | 12.70 ms | — |
+| kernel, upstream's layout | 1.19 ms (2.32×) | 3.75 ms (3.39×) | 40.91 vs 41.93 gated |
+| kernel, native layout (free `view`) | **1.00 ms (2.75×)** | **3.62 ms (3.51×)** | 41.15 vs 41.72 gated |
+| kernel as a `torch.library.custom_op` | same | same | 38.67 vs 42.75 |
+
+Removing the layout copy did help the operator — `value_proj` already produces
+`[batch, sequence, heads, head_dim]`, so replacing `MSDeformAttn.forward` reaches the kernel through a free
+`view` — but the step time did not move. Paired Nsight traces explain it, and it is not the kernel's fault:
+
+- the kernel replaces **59.7 ms** of `grid_sampler` with **41.7 ms** of `im2col`/`col2im` per 1.2 s window,
+- but aten layer-norm kernels around the attention block go from **24 to 48–54 calls (+16.9 ms)**, and cast
+  kernels add **12.8 ms**.
+
+The opaque call splits an Inductor-fused region, and the fp32 conversions the kernel's contract requires stop
+being fused too. Registering it as a `custom_op` — the textbook fix for a graph break — was *worse* (38.67),
+because an opaque node blocks that fusion as well.
+
+**The conclusion is about this model, not the kernel.** While the decoder region is compiled, any opaque
+deformable-attention implementation (Triton, CUDA, custom op) loses more to lost fusion than a 2.7–3.5×
+operator speedup returns. It is worth keeping in an eager configuration (+2.4%) or if the model is ever
+compiled end to end.
+
+Verification: output matches upstream to **3.9e-03**, the bf16 quantum of the final projection, with
+gradients to **4.8e-07**. This also settled a real contract question — upstream holds `attention_weights` as
+`[batch, queries, heads, levels*points]` while the kernel documents rank-5; the layouts are identical in
+memory, and the module-level test confirms it, which the earlier synthetic verifier never exercised.
+
+### Two harness bugs worth naming
+
+Both produced confident, wrong numbers before being caught:
+
+- Benchmarking variants in one process let `apply_patches` leak globally, so the "upstream" rows of later
+  cases silently measured the *patched* core (reported as a flat 1.00× with 0.0 deltas — the tell).
+- Timing the backbone with `requires_grad=True` on the input pixels made cuDNN compute the patch-embedding
+  conv's input gradient with a grouped-direct algorithm: **one kernel, 1.466 s, 97.6% of the measurement**.
+  Training never needs that gradient.
+
+## Is the missing backbone compile actually a loss?
+
+The `compile=True` bug above means the backbone runs eager — but whether that costs anything needed
+measuring, not assuming. Timing the DINOv2 encoder alone at a fixed 576px, batch 8, forward and backward:
+
+| | ms | |
+|---|---|---|
+| eager encoder | **36.5** | |
+| compiled encoder (`dynamic=False`) | **60.6** | **0.60×** |
+
+Reproduced within 0.2 ms across three fresh processes. Nothing exotic is lost — bf16 cutlass GEMM time simply
+doubles (15.0 → 29.3 ms) — and Inductor logs *"Not enough SMs to use max_autotune_gemm mode"* on this 24-SM
+card, so its unautotuned GEMM choices lose to cuBLAS's heuristics.
+
+So on this GPU the upstream bug costs nothing. On the 108-SM A100, where autotuning is available and compile
+did help in the cross-check (14.82 → 15.99 img/s), a compiled backbone may well win — and nobody can find
+out while the resize silently rejects the graph. That is the argument for reporting it upstream.
 
 ## Correctness
 
