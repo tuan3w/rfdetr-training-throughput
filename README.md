@@ -65,7 +65,7 @@ was used only for cross-checks, because a co-tenant held 22.5 GiB and pinned it 
 | fused AdamW | +1.3% | Noise locally; 1.20× on the launch-bound A100. |
 | **fused Triton matcher kernel** | **+20.0%** | Cost matrix in one launch, 174× standalone. |
 | **exact GPU assignment solver** | **+20.9%** | SciPy's `rectangular_lsap` ported to CUDA. |
-| **device-side unpacking** | **+3.1%** | 156 → 13 host/device syncs per step. |
+| **device-side unpacking** | *no measurable gain* | 156 → 13 host/device syncs per step, but a paired A/B puts the throughput effect inside noise (see the correction below). |
 
 ### Kernel 1 — the Hungarian cost matrix (+20%)
 
@@ -107,7 +107,7 @@ Two details mattered:
 
 Verification: **zero index differences** against SciPy on every matcher shape, objective gap `0.00e+00`.
 
-### Then the syncs it exposed (+3.1%)
+### Then the syncs it exposed (no measurable speedup)
 
 With the solve on the GPU, the indices were still copied to the host. `torch.cuda.set_sync_debug_mode`
 attributed **156 synchronising operations per step**, ~130 of them to the criterion indexing CUDA tensors
@@ -287,6 +287,36 @@ already right: `pack_targets`, 16 workers, thread pinning, `expandable_segments:
 
 On the shared A100, the stack measured 10.04 → 16.70 img/s (**+66%**) even while time-slicing with the
 co-tenant, before the solver work existed.
+
+## A correction: two claims that single runs could not support
+
+Two numbers here were produced by single gated runs, and a paired alternating protocol later retired one of
+them.
+
+**Device-side unpacking was published at +3.1%** (from the readings 40.67 → 41.93 img/s). Measured properly —
+six alternating compiled rounds of 60 steps, switching configuration between *every* run — it is:
+
+| | img/s |
+|---|---:|
+| without device-side unpacking | **36.76** |
+| with it | **37.68** |
+
+Per-round deltas: −0.87, +3.38, −1.94, +3.06, −3.19, +6.65 %. Median **+1.09%**, three up and three down:
+inside this machine's noise. Its effect on synchronisations (156 → 13 per step) is measured and unaffected,
+and is the reason it stays in the stack — but it is not a speedup I can demonstrate.
+
+The same protocol killed the upstream version of this change:
+[roboflow/rf-detr#1492](https://github.com/roboflow/rf-detr/pull/1492), which I opened and then closed
+myself. Nine paired rounds gave a median of **+0.23%** with outliers at −6.6% and −12.5%, so there was no
+speedup to claim, even though the sync count on their tree fell **164.3 → 14.7 per step**. A mechanism that
+is real and an improvement that is real are different things.
+
+**What this does not touch is the headline.** 12.81 → 41.93 img/s is 3.27×, measured by repeat-median gates
+with 0.5–2% spread — orders of magnitude clear of the noise — and the large individual wins (fused SDPA
++61.5%, the Triton cost matrix +20.0%, the GPU solver +20.9%) are each many times the noise floor. It is
+specifically the low-single-digit attributions that single runs could not support, and those are now labelled
+as such. The lesson is cheap to state and was expensive to learn: on this box, identical code re-measures
+with up to 12% spread, so anything under ~5% needs alternating paired rounds or it needs no claim at all.
 
 ## How much headroom is left
 
