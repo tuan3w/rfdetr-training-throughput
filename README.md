@@ -233,9 +233,33 @@ Reproduced within 0.2 ms across three fresh processes. Nothing exotic is lost �
 doubles (15.0 → 29.3 ms) — and Inductor logs *"Not enough SMs to use max_autotune_gemm mode"* on this 24-SM
 card, so its unautotuned GEMM choices lose to cuBLAS's heuristics.
 
-So on this GPU the upstream bug costs nothing. On the 108-SM A100, where autotuning is available and compile
-did help in the cross-check (14.82 → 15.99 img/s), a compiled backbone may well win — and nobody can find
-out while the resize silently rejects the graph. That is the argument for reporting it upstream.
+Supplying the meta kernel torch is missing settles it end to end. The graph is then accepted — **seven
+failing compile ids become zero** — and the compiled dynamic backward matches eager bit-exactly on the output
+and to 6e-07 on the gradient. Against a matched control:
+
+| backbone | img/s |
+|---|---:|
+| eager | **35.51** |
+| compiled | **32.27** (−9.1%) |
+
+Both rows use 4 dataloader workers instead of the kept 16, because the symbolic-shape compile otherwise does
+not fit in RAM on this host and `systemd-oomd` kills the run. (The loader ceiling at 4 workers is 159.6 img/s
+against ~42 consumed, so the loader is not the limiter — though both rows sitting below the 16-worker 41.93
+shows that ceiling test overstates how few workers suffice, since it does not model the loader competing with
+the training process for CPU.)
+
+So on this GPU the upstream bug costs nothing — it is arguably load-bearing. On the 108-SM A100, where
+autotuning is available and compile did help in the cross-check (14.82 → 15.99 img/s), a compiled backbone may
+well win, and nobody can find out while the resize silently rejects the graph.
+
+Root cause and fix, filed upstream as
+[pytorch/pytorch#197622](https://github.com/pytorch/pytorch/issues/197622): `_upsample_bicubic2d_aa_backward`
+is missing from the `register_meta` list in `torch/_meta_registrations.py` that already covers the bilinear
+and lanczos equivalents, so with a symbolic output size it reaches the C++ structured kernel and `isIntList()`
+fires an internal assert. Still missing on `main`; 2.14.0 is the latest release and is affected. Verified
+locally that adding it is sufficient — note the registration has to go through
+`op.py_impl(DispatchKey.Meta)`, the way `activate_meta()` wires it at import, since `register_meta` only fills
+a table that has already been read by then.
 
 ## Correctness
 

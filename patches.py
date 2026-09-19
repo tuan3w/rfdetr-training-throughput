@@ -635,6 +635,40 @@ def _apply_fused_msda_native() -> str:
     return "fused_msda_native: deformable attention kernel reached without a layout copy"
 
 
+def _apply_bicubic_meta() -> str:
+    """Supply the missing meta kernel so the model's graph can compile at all.
+
+    ``aten._upsample_bicubic2d_aa_backward`` is absent from the ``register_meta``
+    list in ``torch/_meta_registrations.py`` that already covers
+    ``_upsample_bilinear2d_aa_backward`` and ``_upsample_lanczos2d_aa_backward``,
+    so with a symbolic output size it reaches the C++ structured kernel and
+    ``isIntList()`` fires an internal assert. That is what rejects every graph
+    containing the DINOv2 backbone under ``dynamic=True``
+    (https://github.com/pytorch/pytorch/issues/197622).
+
+    ``register_meta`` only fills a table; the wiring happens once at import in
+    ``activate_meta()`` via ``op.py_impl(DispatchKey.Meta)``. So the fix has to be
+    applied the same way -- registering into the table afterwards does nothing,
+    which is why an earlier attempt looked like it had failed.
+
+    Verified locally with the same meta function bilinear and lanczos share:
+    the compiled dynamic backward matches eager bit-exactly on the output and to
+    6e-07 on the gradient across three output sizes.
+    """
+    import torch
+    from torch import _meta_registrations as registrations
+    from torch._meta_registrations import meta_upsample_bimode2d_aa_backward
+
+    operator = torch.ops.aten._upsample_bicubic2d_aa_backward.default
+    # Testing the Meta dispatch key is useless here: the op already has the C++
+    # structured kernel, and that is precisely the one that asserts. What is
+    # missing is the *Python* meta, so check the registry `activate_meta()` reads.
+    if operator in getattr(registrations, "meta_table", {}):
+        return "bicubic_meta: skipped, this torch already registers the python meta"
+    operator.py_impl(torch._C.DispatchKey.Meta)(meta_upsample_bimode2d_aa_backward)
+    return "bicubic_meta: registered the missing _upsample_bicubic2d_aa_backward meta"
+
+
 PATCHES = {
     "cdist_l1": _apply_cdist_l1,
     "pinned_d2h": _apply_pinned_d2h,
@@ -645,6 +679,7 @@ PATCHES = {
     "parallel_lap": _apply_parallel_lap,
     "cuda_lap": _apply_cuda_lap,
     "device_indices": _apply_device_indices,
+    "bicubic_meta": _apply_bicubic_meta,
     "compile_backbone": _apply_compile_backbone,
     "static_compile": _apply_static_compile,
     "compile_blocks": _apply_compile_blocks,
